@@ -27,3 +27,27 @@ def broadcast_offers():
             time.sleep(1)
         except:
             pass
+
+def start_server():
+    """Starts the TCP server and UDP broadcaster"""
+    threading.Thread(target=broadcast_offers, daemon=True).start()
+
+    # Get local IP address for the printout
+    hostname = socket.gethostname()
+    local_ip = socket.gethostbyname(hostname)
+
+    tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    tcp_sock.bind(("", TCP_PORT))
+    tcp_sock.listen()
+
+    # Matching Example Run: "Server started, listening on IP address..."
+    print(f"Server started, listening on IP address {local_ip}")
+
+    while True:
+        client_conn, addr = tcp_sock.accept()
+        threading.Thread(target=handle_client, args=(client_conn, addr)).start()
+
+
+if __name__ == "__main__":
+    start_server()
