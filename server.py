@@ -28,6 +28,7 @@ def broadcast_offers():
         except:
             pass
 
+
 def start_server():
     """Starts the TCP server and UDP broadcaster"""
     threading.Thread(target=broadcast_offers, daemon=True).start()
