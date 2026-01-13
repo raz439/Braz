@@ -1,76 +1,64 @@
 import socket
-import struct
+from protocol import *
 
-# Protocol Constants
-UDP_PORT = 13122
-MAGIC_COOKIE = 0xabcddcba
-OFFER_TYPE = 0x2
-REQUEST_TYPE = 0x3
-PAYLOAD_TYPE = 0x4
-
-# Colors for visualization
+# UI Colors
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
 BLUE = "\033[94m"
 RESET = "\033[0m"
 
+
 def play_game(ip, port):
-    """Connects to server and plays rounds."""
     suit_icons = {0: '♥', 1: '♦', 2: '♣', 3: '♠'}
     rank_names = {1: 'Ace', 11: 'Jack', 12: 'Queen', 13: 'King'}
 
     try:
+        # Get valid number of rounds from user
         while True:
             rounds_input = input("Enter number of rounds to play (1-10): \n")
-            if rounds_input.isdigit():
-                val = int(rounds_input)
-                if 0 < val <= 10:
-                    rounds = val
-                    break
-                else:
-                    print(f"{RED}Please choose between 1 and 10 rounds.{RESET}")
-            else:
-                print(f"{RED}Invalid input! Please enter a number.{RESET}")
+            if rounds_input.isdigit() and 0 < int(rounds_input) <= 10:
+                rounds = int(rounds_input)
+                break
+            print(f"{RED}Please choose between 1 and 10 rounds.{RESET}")
+
+        # Establish TCP connection with server
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(SOCKET_TIMEOUT)
         sock.connect((ip, port))
 
-        # Send Request
-        name = b"BrazTeam".ljust(32, b'\x00')
-        sock.sendall(struct.pack('!I B B 32s', MAGIC_COOKIE, REQUEST_TYPE, rounds, name))
-        # Send line break after the packet
-        sock.sendall(b'\n')
+        # Send formatted game request
+        sock.sendall(pack_request(rounds, TEAM_NAME))
+        sock.sendall(b'\n')  # Requirement: send line break after packet [cite: 77]
 
         wins = 0
         for r in range(rounds):
             print(f"\n--- Round {r + 1} ---")
-            initial_cards = 0
-            total_points = 0
-            dealer_points = 0
-            first_dealer_reveal = True
-            standing = False
+            initial_cards, total_points, dealer_points = 0, 0, 0
+            first_dealer_reveal, standing = True, False
 
             while True:
                 data = sock.recv(9)
-                if not data:
-                    break
-                _, _, res, rank, suit = struct.unpack('!I B B H B', data)
+                if not data: break
 
-                if res != 0:
-                    # Final summary before showing result
+                # Unpack server payload
+                _, _, res, rank, suit = struct.unpack(PAYLOAD_SERVER_FORMAT, data)
+
+                # Check if round is over
+                if res != RESULT_NOT_OVER:
                     print(f"{YELLOW}Final Scores -> You: {total_points} | Dealer: {dealer_points}{RESET}")
-                    outcome_map = {1: "Tie 🤝", 2: "Loss ❌", 3: "Win 🎉"}
-                    color = GREEN if res == 3 else (RED if res == 2 else RESET)
-                    if res == 3: wins += 1
+                    outcome_map = {RESULT_TIE: "Tie 🤝", RESULT_LOSS: "Loss ❌", RESULT_WIN: "Win 🎉"}
+                    if res == RESULT_WIN: wins += 1
+                    color = GREEN if res == RESULT_WIN else (RED if res == RESULT_LOSS else RESET)
                     print(f"{color}Result: {outcome_map.get(res)}{RESET}")
                     break
 
-                # Calculate value
+                # Calculate card values [cite: 25, 27, 28]
                 val = 11 if rank == 1 else (10 if rank >= 11 else rank)
                 r_name = rank_names.get(rank, str(rank))
                 s_icon = suit_icons.get(suit, str(suit))
 
-                # logic to distinguish between player and dealer cards
+                # Display cards based on game stage [cite: 35, 37, 38]
                 if initial_cards < 2:
                     total_points += val
                     print(f"You received: {r_name} of {s_icon} (Total: {total_points}) 🃏")
@@ -81,35 +69,28 @@ def play_game(ip, port):
                         total_points += val
                         print(f"Hit: {r_name} of {s_icon} (Total: {total_points}) ➕")
                     else:
-                        # Logic for Dealer's turn
                         dealer_points += val
-                        if first_dealer_reveal:
-                            print(f"Dealer reveals hidden card: {r_name} of {s_icon} 🔓")
-                            first_dealer_reveal = False
-                        else:
-                            print(f"Dealer draws: {r_name} of {s_icon} ⏳")
+                        label = "reveals hidden card" if first_dealer_reveal else "draws"
+                        print(f"Dealer {label}: {r_name} of {s_icon} 🔓")
+                        first_dealer_reveal = False
 
                 initial_cards += 1
-                # Only ask for input if we have 3 cards, haven't stood, and haven't busted
+                # Ask for player action if applicable [cite: 40, 41, 42]
                 if initial_cards >= 3 and not standing and total_points <= 21:
                     while True:
                         action = input("Type 'H' to Hit or 'S' to Stand: 👉 \n").strip().lower()
-                        # Check for specific valid inputs only
-                        if action in ['h', 'hit', 'hittt']:
-                            decision = b"Hittt"
+                        if action in ['h', 'hit']:
+                            decision = ACTION_HIT
                             break
                         elif action in ['s', 'stand']:
-                            decision = b"Stand"
+                            decision = ACTION_STAND
                             standing = True
                             break
-                        else:
-                            # Feedback for invalid input to make it fun to read
-                            print(f"'{action}' is not a valid move. Please use 'H' or 'S' ❌.")
-                    sock.sendall(struct.pack('!I B 5s', MAGIC_COOKIE, PAYLOAD_TYPE, decision.ljust(5, b'\x00')))
-                    if decision == b"Stand":
-                        standing = True
+                        print(f"'{action}' is not valid. Use 'H' or 'S' ❌.")
 
-        # Final statistics
+                    sock.sendall(pack_payload_client(decision))
+
+        # Show final session statistics [cite: 81]
         win_rate = int((wins / rounds) * 100)
         print(f"{BLUE}Finished playing {rounds} rounds, win rate: {win_rate}%{RESET}")
         sock.close()
@@ -118,10 +99,9 @@ def play_game(ip, port):
 
 
 def listen_for_offers():
-    """Listens for UDP server announcements."""
+    # Setup UDP socket to listen for server announcements [cite: 107]
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    # Important for running multiple clients on same PC
     if hasattr(socket, 'SO_REUSEPORT'):
         udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
 
@@ -131,8 +111,11 @@ def listen_for_offers():
         print(f"{BLUE}* WELCOME TO BRAZ CASINO *{RESET}")
         print(f"{BLUE}****************************{RESET}")
         print("Client started, listening for offer requests...")
-        data, addr = udp_sock.recvfrom(1024)
-        cookie, mtype, port, name = struct.unpack('!I B H 32s', data[:39])
+
+        # Receive and validate offer [cite: 84, 85]
+        data, addr = udp_sock.recvfrom(BUFFER_SIZE)
+        cookie, mtype, port, name = struct.unpack(OFFER_FORMAT, data[:39])
+
         if cookie == MAGIC_COOKIE and mtype == OFFER_TYPE:
             s_name = name.decode().strip(chr(0))
             print(f"Received offer from {s_name} at {addr[0]}")
