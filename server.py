@@ -3,7 +3,7 @@ import time
 import threading
 from blackjack_game import BlackjackGame
 from protocol import *
-
+import utils # Import utils for colors
 
 def broadcast_offers():
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -18,7 +18,6 @@ def broadcast_offers():
         except:
             pass
 
-
 def handle_client(conn, addr):
     try:
         # Receive and unpack initial request
@@ -31,6 +30,7 @@ def handle_client(conn, addr):
             return
 
         for r in range(rounds):
+            # Server log (visible only to server admin)
             print(f"Starting round {r + 1} for client {addr}")
             game = BlackjackGame()
             game.deal_initial()
@@ -96,7 +96,7 @@ def start_server():
     tcp_sock.bind(("", DEFAULT_TCP_PORT))
     tcp_sock.listen()
 
-    print(f"Server started, listening on IP address {local_ip}")
+    print(f"{utils.Colors.GREEN}Server started, listening on IP address {local_ip}{utils.Colors.RESET}")
 
     while True:
         client_conn, addr = tcp_sock.accept()
