@@ -1,115 +1,129 @@
-import socket
 import time
-import struct
 import threading
-from blackjack_game import BlackjackGame
-
-# Protocol Constants
-UDP_PORT = 13122
-MAGIC_COOKIE = 0xabcddcba
-OFFER_TYPE = 0x2
-REQUEST_TYPE = 0x3
-PAYLOAD_TYPE = 0x4
-SERVER_NAME = "Braz"
-TCP_PORT = 12345
+from blackjack_game import *
+from protocol import *
+from exceptions import *
+from utils import *
 
 
 def broadcast_offers():
-    """Broadcasts server availability via UDP"""
+    # Periodically broadcast server offers via UDP
     udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-    # Pack offer: Cookie(4), Type(1), Port(2), Name(32)
-    name_bytes = SERVER_NAME.encode('utf-8').ljust(32, b'\x00')
-    packet = struct.pack('!I B H 32s', MAGIC_COOKIE, OFFER_TYPE, TCP_PORT, name_bytes)
+    packet = pack_offer(DEFAULT_TCP_PORT, TEAM_NAME)
+
     while True:
         try:
-            udp_sock.sendto(packet, ('255.255.255.255', UDP_PORT))
+            udp_sock.sendto(packet, (BROADCAST_IP, UDP_PORT))
             time.sleep(1)
-        except:
-            pass
+        except Exception:
+            # Ignore transient broadcast errors
+            continue
+
 
 def handle_client(conn, addr):
-    """Manages the TCP game session for a client."""
+    # Handle a single connected client session
     try:
-        # Receive Request: Cookie(4), Type(1), Rounds(1), Name(32)
-        data = conn.recv(1024)
-        if len(data) < 38:
-            return
-        cookie, mtype, rounds, team_name = struct.unpack('!I B B 32s', data[:38])
+        conn.settimeout(SOCKET_TIMEOUT)
+        data = conn.recv(BUFFER_SIZE)
+        validate_payload_size(data, 38)
 
+        # Unpack and validate client request
+        cookie, mtype, rounds, team_name = struct.unpack(REQUEST_FORMAT, data[:38])
         if cookie != MAGIC_COOKIE or mtype != REQUEST_TYPE:
             return
 
-        for r in range(rounds):
-            print(f"Starting round {r + 1} for client {addr}")
+        client_name = team_name.decode('utf-8').strip('\x00')
+        print(f"{Colors.GREEN}Starting {rounds} rounds with {client_name} ({addr[0]}){Colors.RESET}")
+
+        # Play the requested number of rounds
+        for _ in range(rounds):
             game = BlackjackGame()
             game.deal_initial()
 
-            # Send initial 2 player cards
+            # Send player's initial cards
             for card in game.player_hand:
-                conn.sendall(struct.pack('!I B B H B', MAGIC_COOKIE, PAYLOAD_TYPE, 0, card[0], card[1]))
+                conn.sendall(pack_payload_server(RESULT_NOT_OVER, card[0], card[1]))
 
-            # Send dealer's first card face-up
-            d_up = game.dealer_hand[0]
-            conn.sendall(struct.pack('!I B B H B', MAGIC_COOKIE, PAYLOAD_TYPE, 0, d_up[0], d_up[1]))
+            # Send dealer's face-up card
+            conn.sendall(
+                pack_payload_server(
+                    RESULT_NOT_OVER,
+                    game.dealer_hand[0][0],
+                    game.dealer_hand[0][1]
+                )
+            )
 
-            print(f"Initial cards dealt. Waiting for player decision...")
-            # Player turn loop (Moved outside the card dealing loop)
+            # Handle player's turn
             while not game.player_bust():
-                msg = conn.recv(10)
+                msg = conn.recv(BUFFER_SIZE)
                 if not msg:
                     break
-                _, _, dec_bytes = struct.unpack('!I B 5s', msg)
+
+                validate_payload_size(msg, 10)
+                _, _, dec_bytes = struct.unpack(PAYLOAD_CLIENT_FORMAT, msg[:10])
                 decision = dec_bytes.decode('utf-8').strip('\x00').lower()
 
-                if decision == 'hittt':  # Required string
+                if "hittt" in decision:
                     new_card = game.player_hit()
-                    conn.sendall(struct.pack('!I B B H B', MAGIC_COOKIE, PAYLOAD_TYPE, 0, new_card[0], new_card[1]))
+                    conn.sendall(pack_payload_server(RESULT_NOT_OVER, new_card[0], new_card[1]))
                 else:
-                    break  # Stand
+                    break
 
-            # Dealer turn: Reveal hidden card and draw more
+            # Handle dealer's turn if player did not bust
             if not game.player_bust():
-                # Reveal dealer's 2nd card
-                d_second = game.dealer_hand[1]
-                conn.sendall(struct.pack('!I B B H B', MAGIC_COOKIE, PAYLOAD_TYPE, 0, d_second[0], d_second[1]))
-
-                # Draw more cards if sum < 17
+                conn.sendall(
+                    pack_payload_server(
+                        RESULT_NOT_OVER,
+                        game.dealer_hand[1][0],
+                        game.dealer_hand[1][1]
+                    )
+                )
                 while game.hand_sum(game.dealer_hand) < 17:
                     new_card = game.deck.pop()
                     game.dealer_hand.append(new_card)
-                    conn.sendall(struct.pack('!I B B H B', MAGIC_COOKIE, PAYLOAD_TYPE, 0, new_card[0], new_card[1]))
+                    conn.sendall(pack_payload_server(RESULT_NOT_OVER, new_card[0], new_card[1]))
 
-            # Send final result (1: Tie, 2: Loss, 3: Win)
-            res = game.decide_winner()
-            status = {1: "TIE 🤝", 2: "DEALER WINS 💰", 3: "PLAYER WINS 🎉"}.get(res)
-            print(f"Result for {addr}: {status}")
-            conn.sendall(struct.pack('!I B B H B', MAGIC_COOKIE, PAYLOAD_TYPE, res, 0, 0))
-    except:
-        pass
+            # Send final game result
+            conn.sendall(pack_payload_server(game.decide_winner(), 0, 0))
+
+    except Exception as e:
+        # Handle connection and protocol errors
+        print(f"{Colors.RED}{handle_network_error(e)}{Colors.RESET}")
     finally:
+        # Always close the client connection
         conn.close()
 
-def start_server():
-    """Starts the TCP server and UDP broadcaster"""
-    threading.Thread(target=broadcast_offers, daemon=True).start()
 
-    # Get local IP address for the printout
+def start_server():
+    # Initialize server networking and start accepting clients
     hostname = socket.gethostname()
     local_ip = socket.gethostbyname(hostname)
 
+    # Start UDP offer broadcasting in background thread
+    threading.Thread(target=broadcast_offers, daemon=True).start()
+
+    # Set up TCP server socket
     tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     tcp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    tcp_sock.bind(("", TCP_PORT))
-    tcp_sock.listen()
+    tcp_sock.bind(("", DEFAULT_TCP_PORT))
+    tcp_sock.listen(5)
 
-    # Matching Example Run: "Server started, listening on IP address..."
-    print(f"Server started, listening on IP address {local_ip}")
+    print(f"{Colors.BLUE}Server started on IP {local_ip}, port {DEFAULT_TCP_PORT}{Colors.RESET}")
 
+    # Accept and handle incoming client connections
     while True:
-        client_conn, addr = tcp_sock.accept()
-        threading.Thread(target=handle_client, args=(client_conn, addr)).start()
+        try:
+            client_conn, addr = tcp_sock.accept()
+            threading.Thread(
+                target=handle_client,
+                args=(client_conn, addr)
+            ).start()
+        except Exception:
+            # Ignore accept errors and continue serving
+            continue
 
 
+# Entry point of the server application
 if __name__ == "__main__":
     start_server()
